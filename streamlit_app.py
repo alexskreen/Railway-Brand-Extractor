@@ -1,6 +1,6 @@
 import streamlit as st
 import json
-from brand_extractor_selenium import extract_brand
+from brand_extractor import extract_brand
 from PIL import Image
 import os
 
