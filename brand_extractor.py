@@ -4,7 +4,8 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from urllib.parse import urljoin, urlparse
 import os
 import re
@@ -47,29 +48,36 @@ class BrandExtractor:
         }
 
     def _init_driver(self):
-        """Initialize Selenium WebDriver."""
+        """Initialize Selenium WebDriver with webdriver-manager."""
         if self.driver is None:
-            chrome_options = Options()
+            chrome_options = webdriver.ChromeOptions()
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--headless")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+
             try:
-                self.driver = webdriver.Chrome(options=chrome_options)
+                service = Service(ChromeDriverManager().install())
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
             except Exception as e:
                 self.result['errors'].append(f"Failed to initialize Chrome driver: {str(e)}")
                 raise
 
     def _close_driver(self):
         """Close Selenium WebDriver."""
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
+        try:
+            if self.driver:
+                self.driver.quit()
+                self.driver = None
+        except Exception:
+            pass
 
     def _fetch_page(self) -> bool:
         """Fetch the page using Selenium."""
         try:
             self._init_driver()
+            self.driver.set_page_load_timeout(15)
             self.driver.get(self.url)
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_all_elements_located((By.TAG_NAME, "body"))
@@ -104,18 +112,15 @@ class BrandExtractor:
 
         color_str = color_str.strip().lower()
 
-        # Already hex
         if color_str.startswith('#'):
             rgb = self._hex_to_rgb(color_str)
             return color_str if rgb else None
 
-        # RGB/RGBA format
         rgb_match = re.match(r'rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)', color_str)
         if rgb_match:
             r, g, b = int(rgb_match.group(1)), int(rgb_match.group(2)), int(rgb_match.group(3))
             return self._rgb_to_hex((r, g, b))
 
-        # Named colors
         named_colors = {
             'white': '#ffffff', 'black': '#000000', 'red': '#ff0000',
             'green': '#008000', 'blue': '#0000ff', 'gray': '#808080',
@@ -128,7 +133,6 @@ class BrandExtractor:
         """Find and download the logo."""
         logo_urls = []
 
-        # Only use specific logo selectors
         logo_selectors = [
             ('img[src*="logo"]', 'src'),
             ('img[alt*="logo" i]', 'src'),
@@ -141,24 +145,13 @@ class BrandExtractor:
             ('[id*="logo"] img', 'src'),
             ('img[class*="brand"]', 'src'),
             ('img.brand', 'src'),
-            ('svg#logo', 'data'),
-            ('svg.logo', 'data'),
-            ('svg[id*="logo"]', 'data'),
-            ('svg[class*="logo"]', 'data'),
         ]
 
         for selector, attr in logo_selectors:
             try:
                 elements = self.soup.select(selector)
                 for elem in elements:
-                    url = None
-                    if attr == 'data' and elem.name == 'svg':
-                        svg_str = str(elem)
-                        if svg_str and len(svg_str) > 50:
-                            url = f"data:image/svg+xml,{svg_str}"
-                    else:
-                        url = elem.get(attr)
-
+                    url = elem.get(attr)
                     if url and url not in logo_urls:
                         logo_urls.append(urljoin(self.url, url))
                         if len(logo_urls) >= 3:
@@ -180,21 +173,6 @@ class BrandExtractor:
     def _download_logo(self, logo_url: str) -> bool:
         """Download and save the logo."""
         try:
-            if logo_url.startswith('data:image/svg+xml'):
-                svg_str = logo_url.replace('data:image/svg+xml,', '')
-                svg_bytes = svg_str.encode('utf-8')
-                logo_path = os.path.join(self.output_dir, f"{self.domain}_logo.png")
-
-                try:
-                    import cairosvg
-                    cairosvg.svg2png(bytestring=svg_bytes, write_to=logo_path)
-                    self.result['logo'] = logo_path
-                    self.result['logo_url'] = "inline SVG"
-                    return True
-                except Exception:
-                    self.result['logo_url'] = logo_url
-                    return False
-
             response = requests.get(logo_url, timeout=10)
             response.raise_for_status()
 
@@ -267,16 +245,16 @@ class BrandExtractor:
             self.result['background_image_url'] = bg_url
             return True
         except Exception as e:
-            self.result['errors'].append(f"Failed to download background image from {bg_url}: {str(e)}")
+            self.result['errors'].append(f"Failed to download background image: {str(e)}")
             return False
 
     def _extract_colors(self):
-        """Extract background, text, and button colors from computed styles."""
+        """Extract colors using Selenium computed styles."""
         try:
             if not self.driver:
                 return
 
-            # Extract background color from body
+            # Background color
             try:
                 body = self.driver.find_element(By.TAG_NAME, "body")
                 bg_color = body.value_of_css_property("background-color")
@@ -287,9 +265,9 @@ class BrandExtractor:
             except Exception:
                 pass
 
-            # Extract button colors
+            # Button color
             try:
-                button_selectors = ['button', '[class*="btn"]', '[class*="cta"]', 'a[role="button"]']
+                button_selectors = ['button', '[class*="btn"]', '[class*="cta"]']
                 for selector in button_selectors:
                     buttons = self.driver.find_elements(By.CSS_SELECTOR, selector)
                     if buttons and not self.result['button_color']:
@@ -303,12 +281,12 @@ class BrandExtractor:
             except Exception:
                 pass
 
-            # Extract font colors from various elements
+            # Font colors
             font_colors = []
             try:
                 for tag in ['h1', 'h2', 'p', 'a']:
                     elements = self.driver.find_elements(By.TAG_NAME, tag)
-                    for elem in elements[:5]:
+                    for elem in elements[:3]:
                         try:
                             color = elem.value_of_css_property("color")
                             if color:
@@ -332,12 +310,7 @@ class BrandExtractor:
             self.result['errors'].append(f"Error extracting colors: {str(e)}")
 
     def extract(self) -> Dict:
-        """
-        Main method to extract all brand information.
-
-        Returns:
-            Dictionary containing extracted brand information
-        """
+        """Main method to extract all brand information."""
         try:
             if not self._fetch_page():
                 return self.result
@@ -356,16 +329,7 @@ class BrandExtractor:
 
 
 def extract_brand(url: str, output_dir: str = "./brand_assets") -> Dict:
-    """
-    Convenience function to extract brand information from a URL.
-
-    Args:
-        url: Website URL to analyze
-        output_dir: Directory to save logo assets
-
-    Returns:
-        Dictionary with extracted brand information
-    """
+    """Convenience function to extract brand information from a URL."""
     extractor = BrandExtractor(url, output_dir)
     return extractor.extract()
 
